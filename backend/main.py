@@ -1,9 +1,10 @@
 import os
 import json
-from dotenv import load_dotenv
-load_dotenv()
 import io
 import base64
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -24,7 +25,6 @@ app.add_middleware(
 
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-
 csv_store: dict[str, pd.DataFrame] = {}
 
 SYSTEM_PROMPT = """You are a data analyst assistant. The user has uploaded a CSV file.
@@ -37,20 +37,22 @@ Respond in this EXACT JSON format, nothing else:
     "type": "bar" | "line" | "pie" | "scatter" | "hist" | null,
     "x": "column_name_or_null",
     "y": "column_name_or_null",
-    "title": "Chart title",
-    "color": null
+    "agg": "mean" | "sum" | "count" | null,
+    "title": "Chart title"
   },
   "table": [{"col": "val"}, ...] | null
 }
 
 Rules:
-- Return ONLY the JSON object. No markdown fences, no extra text before or after.
+- Return ONLY the JSON object. No markdown fences, no extra text.
 - chart is null if no visualization is needed.
-- table is null if no tabular result is needed. Use table for top-N results, groupby results, etc. Max 20 rows.
-- For pie charts, x = category column, y = value column.
-- For hist, x = numeric column, y = null.
-- answer should be concise (1-3 sentences), human-friendly, insightful.
-- If asked something unanswerable from the data, say so in answer and set chart+table to null.
+- agg controls how y is aggregated when grouping by x. Use "mean" for averages, "sum" for totals, "count" to count rows. Default to "mean" for numeric columns unless the question implies totals.
+- table is null if no tabular result needed. Max 20 rows.
+- For pie: x = category column, y = value column.
+- For hist: x = numeric column, y = null, agg = null.
+- For scatter: no aggregation, just raw x and y columns.
+- answer should be 1-3 sentences, human-friendly, insightful.
+- If unanswerable, say so in answer and set chart+table to null.
 """
 
 
@@ -79,20 +81,12 @@ async def upload_csv(file: UploadFile = File(...)):
     session_id = base64.urlsafe_b64encode(os.urandom(12)).decode()
     csv_store[session_id] = df
 
-    schema = {
-        "shape": list(df.shape),
-        "columns": {col: str(df[col].dtype) for col in df.columns},
-        "sample": df.head(5).to_dict(orient="records"),
-        "nulls": df.isnull().sum().to_dict(),
-    }
-
     return {
         "session_id": session_id,
         "filename": file.filename,
         "rows": df.shape[0],
         "columns": list(df.columns),
         "dtypes": {col: str(df[col].dtype) for col in df.columns},
-        "schema": schema,
     }
 
 
@@ -126,14 +120,11 @@ Respond only with the JSON format described. No markdown, no extra text."""
             ],
         )
         raw = response.choices[0].message.content.strip()
-
-        # Strip markdown fences if the model adds them anyway
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
             raw = raw.strip()
-
         parsed = json.loads(raw)
 
     except json.JSONDecodeError:
@@ -159,6 +150,7 @@ def generate_chart(df: pd.DataFrame, spec: dict) -> str:
     chart_type = spec.get("type")
     x_col = spec.get("x")
     y_col = spec.get("y")
+    agg = spec.get("agg", "mean")
     title = spec.get("title", "")
 
     fig, ax = plt.subplots(figsize=(9, 5))
@@ -176,10 +168,15 @@ def generate_chart(df: pd.DataFrame, spec: dict) -> str:
 
     if chart_type == "bar":
         if x_col and y_col:
-            data = df.groupby(x_col)[y_col].sum().reset_index()
+            if agg == "mean":
+                data = df.groupby(x_col)[y_col].mean().reset_index()
+            elif agg == "count":
+                data = df.groupby(x_col)[y_col].count().reset_index()
+            else:
+                data = df.groupby(x_col)[y_col].sum().reset_index()
             ax.bar(data[x_col].astype(str), data[y_col], color=ACCENT, edgecolor="none")
             ax.set_xlabel(x_col)
-            ax.set_ylabel(y_col)
+            ax.set_ylabel(f"{agg}({y_col})" if agg else y_col)
             if len(data) > 8:
                 plt.xticks(rotation=45, ha="right")
         else:
@@ -205,13 +202,11 @@ def generate_chart(df: pd.DataFrame, spec: dict) -> str:
         else:
             data = df[df.columns[0]].value_counts().head(8)
         colors = [ACCENT, ACCENT2, "#f7c26a", "#f76a8a", "#6af7c2", "#c26af7", "#f7a06a", "#6ac2f7"]
-        wedges, texts, autotexts = ax.pie(
+        ax.pie(
             data.values, labels=data.index.astype(str),
             autopct="%1.1f%%", colors=colors[:len(data)],
             textprops={"color": "#e8e8f0", "fontsize": 9}
         )
-        for at in autotexts:
-            at.set_color("#0f0f14")
 
     elif chart_type == "scatter":
         if x_col and y_col:
